@@ -1,0 +1,245 @@
+#!/bin/sh
+#
+
+#############################################################
+# AnripDdns v6.0.0
+#
+# Dynamic DNS using DNSPod API
+#
+# Author: anrip, https://www.anrip.com/?s=dnspod
+# Collaborators: ProfFan, https://github.com/ProfFan
+#
+# Usage: please refer to `ddnspod.sh`
+#
+#############################################################
+
+# TokenID,Token
+
+export arToken=""
+
+# Get WAN-IP
+
+arWanIp() {
+
+    local hostIp
+
+    local lanIps="^$"
+
+    lanIps="$lanIps|(^10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$)"
+    lanIps="$lanIps|(^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$)"
+    lanIps="$lanIps|(^169\.254\.[0-9]{1,3}\.[0-9]{1,3}$)"
+    lanIps="$lanIps|(^172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]{1,3}\.[0-9]{1,3}$)"
+    lanIps="$lanIps|(^192\.168\.[0-9]{1,3}\.[0-9]{1,3}$)"
+
+    case $(uname) in
+        'Linux')
+            hostIp=$(ip -o -4 addr list | grep -Ev '\s(docker|lo)' | awk '{print $4}' | cut -d/ -f1 | grep -Ev "$lanIps")
+        ;;
+        'Darwin')
+            hostIp=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}' | grep -Ev "$lanIps")
+        ;;
+    esac
+
+    if [ -z "$hostIp" ]; then
+        if type wget >/dev/null 2>&1; then
+            hostIp=$(wget --quiet --output-document=- http://members.3322.org/dyndns/getip)
+        else
+            hostIp=$(curl -s http://members.3322.org/dyndns/getip)
+        fi
+    fi
+
+    echo $hostIp
+
+}
+
+# Get WAN IPv6
+
+arWan6Ip() {
+
+    local hostIp
+
+    local lanIps="(^$)|(^::1$)|(^fe[8-9,A-F])"
+
+    case $(uname) in
+        'Linux')
+            hostIp=$(ip -o -6 addr list | grep -Ev '\s(docker|lo)' | awk '{print $4}' | cut -d/ -f1 | grep -Ev "$lanIps" | tail -n 1)
+        ;;
+        'Darwin')
+            hostIp=$(ifconfig | grep "inet6 " | awk '{print $2}' | grep -Ev "$lanIps" | tail -n 1)
+        ;;
+    esac
+
+    if [ -z "$hostIp" ]; then
+        echo "arWan6Ip: No IPv6 address found, please check if you have one"
+        return 1
+    fi
+
+    echo $hostIp
+
+}
+
+# Dnspod Bridge
+# Arg: type data
+
+arDdnsApi() {
+
+    local agent="AnripDdns/6.0.0(mail@anrip.com)"
+
+    local apiurl="https://dnsapi.cn/${1:?'Info.Version'}"
+    local params="login_token=$arToken&format=json&$2"
+
+    if type wget >/dev/null 2>&1; then
+        wget --quiet --no-check-certificate --output-document=- --user-agent=$agent --post-data $params $apiurl
+    else
+        curl -s -A $agent -d $params $apiurl
+    fi
+
+}
+
+# Dnspod Domain ID & Record ID
+# Arg: record-type domain subdomain
+
+arDdnsId() {
+
+    local domainId
+    local recordId
+    local errMsg
+
+    # Get domain ID
+    domainId=$(arDdnsApi "Domain.Info" "domain=$2")
+    domainId=$(echo $domainId | sed 's/.*"id":"\([0-9]*\)".*/\1/')
+
+    if ! [ "$domainId" -gt 0 ] 2>/dev/null ;then
+        errMsg=$(echo $domainId | sed 's/.*"message":"\([^\"]*\)".*/\1/')
+        echo "arDdnsId: $errMsg"
+        return 1
+    fi
+
+    # Get Record ID
+    recordId=$(arDdnsApi "Record.List" "domain_id=$domainId&sub_domain=$3&record_type=$1")
+    recordId=$(echo $recordId | sed 's/.*"id":"\([0-9]*\)".*/\1/')
+
+    if ! [ "$recordId" -gt 0 ] 2>/dev/null ;then
+        errMsg=$(echo $recordId | sed 's/.*"message":"\([^\"]*\)".*/\1/')
+        echo "arDdnsId: $errMsg"
+        return 1
+    fi
+
+    echo $domainId $recordId
+}
+
+# Fetch Record Ip
+# Arg: domain-id record-id
+
+arDdnsRecordIp() {
+
+    local recordIp
+
+    # Last IP
+    recordIp=$(arDdnsApi "Record.Info" "domain_id=$1&record_id=$2")
+    recordIp=$(echo $recordIp | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+
+    # Output IP
+    case "$recordIp" in
+        [1-9]*)
+            echo $recordIp
+            return 0
+        ;;
+        *)
+            errMsg=$(echo $recordIp | sed 's/.*"message":"\([^\"]*\)".*/\1/')
+            echo "arDdnsRecordIp: $errMsg"
+            return 1
+        ;;
+    esac
+
+}
+
+# Update Record Ip
+# Arg: domain-id record-id sub-domain update-ip
+
+arDdnsUpdate() {
+
+    local recordType
+    local recordRs
+    local recordIp
+    local recordCd
+    local errMsg
+
+    if [ -n "$(echo "$4" | awk '/^[0-9a-zA-Z:]+$/')" ]; then
+        recordType="AAAA"
+    elif [ -n "$(echo "$4" | awk '/^[0-9\.]+$/')" ]; then
+        recordType="A"
+    else
+        echo "arDdnsRecordUpdate: bad ip address"
+        return 1
+    fi
+    
+    # Update IP
+    recordRs=$(arDdnsApi "Record.Modify" "domain_id=$1&record_id=$2&sub_domain=$3&record_type=$recordType&value=$4&record_line=%e9%bb%98%e8%ae%a4")
+    recordIp=$(echo $recordRs | sed 's/.*,"value":"\([0-9a-fA-F\.\:]*\)".*/\1/')
+    recordCd=$(echo $recordRs | sed 's/.*{"code":"\([0-9]*\)".*/\1/')
+
+    # Output IP
+    if [ "$recordIp" = "$4" ] && [ "$recordCd" = "1" ]; then
+        echo $recordIp
+        return 0
+    else
+        # Echo error message
+        errMsg=$(echo $recordRs | sed 's/.*,"message":"\([^"]*\)".*/\1/')
+        echo "arDdnsRecordUpdate: $errMsg"
+        return 1
+    fi
+    
+}
+
+# DDNS Check
+# Arg: Main Sub
+arDdnsCheck() {
+
+    local postRs
+    local ddnsIds
+    local lastIP
+    local hostIp
+
+    if [ $# -eq 3 ] && [ $3 -eq 6 ]; then
+        hostIp=$(arWan6Ip)
+        if [ $? -ne 0 ]; then
+            echo "$hostIp"
+            return 1
+        fi
+        ddnsIds=$(arDdnsId "AAAA" "$1" "$2")
+    else
+        hostIp=$(arWanIp)
+        ddnsIds=$(arDdnsId "A" "$1" "$2")
+    fi
+
+    if [ $? -ne 0 ]; then
+        echo "$ddnsIds"
+        return 1
+    fi
+
+    echo "Updating Domain: $2.$1"
+    echo "Domain IDs: $ddnsIds"
+    echo "Host Ip: $hostIp"
+    
+    lastIP=$(arDdnsRecordIp $(echo $ddnsIds))
+    if [ $? -eq 0 ]; then
+        echo "lastIP: $lastIP"
+        if [ "$lastIP" != "$hostIp" ]; then
+            postRs=$(arDdnsUpdate $(echo $ddnsIds) $2 $hostIp)
+            if [ $? -eq 0 ]; then
+                echo "postRs: $postRs"
+                return 0
+            else
+                echo "$postRs"
+                return 1
+            fi
+        fi
+        echo "Last IP is the same as current IP!"
+        return 1
+    fi
+
+    echo "$lastIP"
+    return 1
+
+}
